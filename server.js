@@ -1,13 +1,14 @@
 import http from "node:http";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = process.env.DB_PATH || join(__dirname, "data", "core-slices.json");
 const port = Number(process.env.PORT || 3025);
-const testHooksEnabled = process.env.ALLOW_TEST_HOOKS !== "0";
+// 测试故障开关：仅显式 ALLOW_TEST_HOOKS=1 时启用，正式运行（未设置）不受请求头影响。
+const testHooksEnabled = process.env.ALLOW_TEST_HOOKS === "1";
 const statuses = ["待切割", "制片中", "待观察", "已交付"];
 const taskSteps = ["取样", "切割", "研磨", "染色", "观察"];
 const reviewStatuses = ["待占位", "盲评中", "待仲裁", "仲裁中", "已定稿", "待处理"];
@@ -37,12 +38,29 @@ const seed = {
 
 const nowIso = () => new Date().toISOString();
 
-// 原子写入：先写临时文件再改名，任何失败都不会留下写了一半的库文件。
+// 原子写入：唯一临时文件 + 改名；失败时清理临时文件，不留部分数据。
+let saveCounter = 0;
 async function saveDb(db, req) {
   if (testHooksEnabled && req && req.headers["x-test-fail-save"] === "1") throw new Error("simulated_save_failure");
-  const tmp = dbPath + ".tmp";
-  await writeFile(tmp, JSON.stringify(db, null, 2));
-  await rename(tmp, dbPath);
+  const tmp = `${dbPath}.${process.pid}.${++saveCounter}.tmp`;
+  try {
+    await writeFile(tmp, JSON.stringify(db, null, 2));
+    await rename(tmp, dbPath);
+  } catch (error) {
+    await rm(tmp, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+// 清理历史遗留的临时文件（如进程在写盘与改名之间被杀死）。
+async function sweepTmpFiles() {
+  const dir = dirname(dbPath);
+  const name = basename(dbPath);
+  for (const f of await readdir(dir)) {
+    if (f === name + ".tmp" || (f.startsWith(name + ".") && f.endsWith(".tmp"))) {
+      await rm(join(dir, f), { force: true }).catch(() => {});
+    }
+  }
 }
 
 // 互斥锁：所有写操作串行化，并发抢名额/重复提交只会有一个生效。
@@ -88,18 +106,33 @@ function migrate(db) {
     for (const slice of sample.slices || []) {
       if (slice.status === "观察" && ensureReview(db, sample, slice)) changed = true;
     }
+    const before = sample.status;
+    updateSampleStatus(sample);
+    if (sample.status !== before) changed = true;
   }
   return changed;
 }
 
-async function loadDb() {
-  if (!existsSync(dbPath)) {
-    await mkdir(dirname(dbPath), { recursive: true });
-    await saveDb(seed);
+// 初始化只进行一次：并发首屏请求共享同一个初始化 Promise，全部等它完成后成功返回。
+let readyPromise = null;
+function ensureReady() {
+  if (!readyPromise) {
+    readyPromise = (async () => {
+      await mkdir(dirname(dbPath), { recursive: true });
+      await sweepTmpFiles();
+      if (!existsSync(dbPath)) await saveDb(seed);
+      const db = JSON.parse(await readFile(dbPath, "utf8"));
+      if (migrate(db)) await saveDb(db);
+    })();
+    // 初始化失败时重置，后续请求可重试；本次并发请求都会收到同一个错误。
+    readyPromise.catch(() => { readyPromise = null; });
   }
-  const db = JSON.parse(await readFile(dbPath, "utf8"));
-  if (migrate(db)) await saveDb(db);
-  return db;
+  return readyPromise;
+}
+
+async function loadDb() {
+  await ensureReady();
+  return JSON.parse(await readFile(dbPath, "utf8"));
 }
 
 async function body(req) {
@@ -113,8 +146,8 @@ function sendJson(res, status, data) {
 }
 function updateSampleStatus(sample) {
   const sliceStatuses = sample.slices.map(slice => slice.status);
-  if (sliceStatuses.length && sliceStatuses.every(step => step === "观察")) sample.status = "待观察";
   if (sample.delivery === "已交付") sample.status = "已交付";
+  else if (sliceStatuses.length && sliceStatuses.every(step => step === "观察")) sample.status = "待观察";
   else if (sliceStatuses.some(step => ["取样", "切割", "研磨", "染色"].includes(step))) sample.status = "制片中";
   else sample.status = "待切割";
 }
